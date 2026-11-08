@@ -122,3 +122,7 @@ else:
             f"{value_text(min(values), 2) if values else 'n/a'} to "
             f"{value_text(max(values), 2) if values else 'n/a'}\n"
             f"Shared card scale: {scale:.3f} | Grid: {cols} columns")
+
+# Default Script component outputs for a quick preview.
+a = Base + Sites + Cards + Links
+print(Info)
