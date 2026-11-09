@@ -3,7 +3,8 @@
 Keep x connected to the existing JSON path or export folder.
 Optional outputs: Base, MapBlockBoundaries, MapPlots, BlockCards, BlockLabelPoints, BlockLabels,
 Plots, Selected, Boxes, LabelPoints, Labels, MapLinks, RowLinks, BlockIDs,
-PlotTree. a previews the exploded plots of blocks containing selected plots.
+PlotTree, BlockCardPlots, BlockCardMarkers, TextCurves.
+a previews the labeled block plans and exploded plots.
 Base and MapLinks can be previewed separately for site context. y is unused.
 """
 import csv
@@ -22,6 +23,7 @@ MARGIN = 150.0
 STEP_X = 1800.0
 STEP_Y = 2250.0
 MAX_PER_ROW = 12
+GROUP_GAP = 500.0
 BLOCK_TOLERANCE = 0.01  # Local export coordinates are in feet.
 
 # Legacy named outputs are initialized for existing definitions.
@@ -34,6 +36,7 @@ Plots, Others, Selected, Boxes, LabelPoints, Labels, BlockIDs, BBL, Area = (
 SelectedPts = LabelPoints
 MapPlots, BlockCards, BlockLabelPoints, BlockLabels = [], [], [], []
 MapBlockBoundaries = []
+BlockCardPlots, BlockCardMarkers, TextCurves = [], [], []
 MapLinks, RowLinks = [], []
 PlotTree = DataTree[Object]()
 Info = ""
@@ -153,6 +156,15 @@ def line(x1, y1, x2, y2):
     return rg.LineCurve(rg.Point3d(x1, y1, 0), rg.Point3d(x2, y2, 0))
 
 
+def add_text(value, x, y, height, bold=False):
+    plane = rg.Plane(rg.Point3d(x, y, 0), rg.Vector3d.ZAxis)
+    outlines = rg.Curve.CreateTextOutlines(
+        value, "Arial", height, int(bold), True, plane, 1.0, BLOCK_TOLERANCE
+    )
+    if outlines:
+        TextCurves.extend(outlines)
+
+
 if x:
     path = os.path.expanduser(str(x).strip().strip('"'))
     records, block_outlines, boundary = read_inputs(path)
@@ -182,32 +194,48 @@ if x:
     BlockIDs = sorted(grouped)
     row_index = 0
     missing_boundaries = []
+    half_box = BOX / 2
+    left = first_header_x - half_box
+    add_text("BLOCK PLAN   /   EXPLODED TAX LOTS", left, first_row_y + 1130, 160, bold=True)
+    add_text("Circle on plan / box in row = selected plot", left, first_row_y + 890, 105)
     for block_index, block in enumerate(BlockIDs):
         lots = sorted(grouped[block], key=lambda lot: (-lot[5], lot[0]))
         selected_count = sum(bool(lot[1]) for lot in lots)
+        parcel_outlines = [curve for lot in lots for curve in lot[2]]
         source_block = block_outlines.get(block) or dissolve_block(lots)
         if source_block:
             MapBlockBoundaries.extend(source_block)
         else:
             missing_boundaries.append(block)
-            source_block = [curve for lot in lots for curve in lot[2]]
-            Base.extend(source_block)
-        block_bounds, block_span = measure(source_block)
+            Base.extend(parcel_outlines)
+        block_bounds, block_span = measure(parcel_outlines + (source_block or []))
         # An actual point on the source block outline identifies the map endpoint.
-        anchor = source_block[0].PointAtStart
-        cy = first_row_y - row_index * STEP_Y
+        anchor = (source_block or parcel_outlines)[0].PointAtStart
+        cy = first_row_y - row_index * STEP_Y - block_index * GROUP_GAP
         link = line(anchor.X, anchor.Y, first_header_x - BOX / 2, cy)
         MapLinks.append(link)
 
         for offset in range(0, len(lots), MAX_PER_ROW):
             row = lots[offset:offset + MAX_PER_ROW]
-            cy = first_row_y - row_index * STEP_Y
-            BlockCards.extend(fit(source_block, block_bounds.Center, block_span, first_header_x, cy))
-            BlockLabelPoints.append(rg.Point3d(first_header_x - BOX / 2, cy - BOX / 2 - 145, 0))
+            cy = first_row_y - row_index * STEP_Y - block_index * GROUP_GAP
+            BlockCards.extend(fit(source_block or [], block_bounds.Center, block_span, first_header_x, cy))
+            BlockCardPlots.extend(fit(parcel_outlines, block_bounds.Center, block_span, first_header_x, cy))
+            block_scale = (BOX - 2 * MARGIN) / block_span
+            for _, label, _, _, center, _ in lots:
+                if label:
+                    marker = rg.Point3d(
+                        first_header_x + (center.X - block_bounds.Center.X) * block_scale,
+                        cy + (center.Y - block_bounds.Center.Y) * block_scale, 0
+                    )
+                    BlockCardMarkers.append(rg.Circle(marker, 36).ToNurbsCurve())
+
+            BlockLabelPoints.append(rg.Point3d(left, cy - half_box - 145, 0))
             suffix = " (cont.)" if offset else ""
             BlockLabels.append(f"Block {block}{suffix} | {len(lots)} plots | {selected_count} selected")
+            add_text(f"BLOCK {block}{suffix}", left, cy - half_box - 235, 130, bold=True)
+            add_text(f"{len(lots)} plots / {selected_count} selected", left, cy - half_box - 410, 92)
             end_x = first_header_x + len(row) * STEP_X
-            rail_y = cy - BOX / 2 - 30
+            rail_y = cy - half_box - 65
             RowLinks.append(line(first_header_x, rail_y, end_x, rail_y))
 
             for col, (bbl, label, curves, area, center, span) in enumerate(row, 1):
@@ -216,23 +244,25 @@ if x:
                 for curve in fit(curves, center, span, cx, cy):
                     destination.append(curve)
                     PlotTree.Add(curve, GH_Path(block_index))
+                add_text(bbl, cx - half_box, cy - half_box - 235, 106)
                 if label:
-                    h = BOX / 2
+                    h = half_box
                     box = [(cx-h, cy-h), (cx+h, cy-h), (cx+h, cy+h),
                            (cx-h, cy+h), (cx-h, cy-h)]
                     Boxes.append(ring_curve(box))
                     LabelPoints.append(rg.Point3d(cx - h, cy - h - 145, 0))
                     Labels.append(f"{label} | {bbl}")
+                    add_text(f"{label}  SELECTED", cx - h, cy - h - 410, 102, bold=True)
                 BBL.append(bbl)
                 Area.append(area)
             row_index += 1
 
-    Blocks = BlockCards
+    Blocks = BlockCards + BlockCardPlots + BlockCardMarkers
     Plots = Others
     Cards = Others + Selected
     Links = MapLinks + RowLinks
     Base.extend(MapBlockBoundaries)
-    a = BlockCards + Cards + Boxes + RowLinks
+    a = Blocks + Cards + Boxes + RowLinks + TextCurves
     Info = (f"{len(BBL):,} of {len(records):,} plots shown | {len(BlockIDs):,} blocks with selected plots"
             f" | {row_index:,} rows | {len(Labels)} selected"
             f" | {len(BlockIDs) - len(missing_boundaries):,} blocks outlined")
