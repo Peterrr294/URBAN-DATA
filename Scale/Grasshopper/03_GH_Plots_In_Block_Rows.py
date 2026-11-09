@@ -1,7 +1,7 @@
 """Rhino 8 Grasshopper Python 3 Script Mode.
 
 Keep x connected to the existing JSON path or export folder.
-Optional outputs: Base, MapPlots, BlockCards, BlockLabelPoints, BlockLabels,
+Optional outputs: Base, MapBlockBoundaries, MapPlots, BlockCards, BlockLabelPoints, BlockLabels,
 Plots, Selected, Boxes, LabelPoints, Labels, MapLinks, RowLinks, BlockIDs,
 PlotTree. a previews the site-to-block-to-plot diagram. y is unused.
 """
@@ -12,6 +12,7 @@ from collections import defaultdict
 from Grasshopper import DataTree
 from Grasshopper.Kernel.Data import GH_Path
 from System import Object
+from System.Collections.Generic import List
 import Rhino.FileIO as rio
 import Rhino.Geometry as rg
 
@@ -20,6 +21,7 @@ MARGIN = 150.0
 STEP_X = 1800.0
 STEP_Y = 2250.0
 MAX_PER_ROW = 100
+BLOCK_TOLERANCE = 0.01  # Local export coordinates are in feet.
 
 # Legacy named outputs are initialized for existing definitions.
 a, Base, Sites, Blocks, Cards, Links, Theme, Colors, TrafficLabels = (
@@ -30,6 +32,7 @@ Plots, Others, Selected, Boxes, LabelPoints, Labels, BlockIDs, BBL, Area = (
 )
 SelectedPts = LabelPoints
 MapPlots, BlockCards, BlockLabelPoints, BlockLabels = [], [], [], []
+MapBlockBoundaries = []
 MapLinks, RowLinks = [], []
 PlotTree = DataTree[Object]()
 Info = ""
@@ -113,6 +116,26 @@ def measure(curves):
     return bounds, span
 
 
+def dissolve_block(lots):
+    """Build a block footprint from closed plot rings, keeping holes."""
+    if len(lots) == 1:
+        return lots[0][2]
+
+    faces = List[rg.Brep]()
+    for _, _, curves, _, _, _ in lots:
+        loops = List[rg.Curve]()
+        for curve in curves:
+            loops.Add(curve)
+        plot_faces = rg.Brep.CreatePlanarBreps(loops, BLOCK_TOLERANCE)
+        if not plot_faces:
+            return []
+        for face in plot_faces:
+            faces.Add(face)
+
+    merged = rg.Brep.CreatePlanarUnion(faces, rg.Plane.WorldXY, BLOCK_TOLERANCE)
+    return [loop.To3dCurve() for face in (merged or []) for loop in face.Loops]
+
+
 def fit(curves, center, span, cx, cy):
     scaling = rg.Transform.Scale(center, (BOX - 2 * MARGIN) / span)
     move = rg.Transform.Translation(cx - center.X, cy - center.Y, -center.Z)
@@ -151,12 +174,17 @@ if x:
     Base = list(boundary)
     BlockIDs = sorted(grouped)
     row_index = 0
+    missing_boundaries = []
     selected_map_links = []
     for block_index, block in enumerate(BlockIDs):
         lots = sorted(grouped[block], key=lambda lot: (-lot[5], lot[0]))
-        # If the export has no dissolved block, show the original grouped parcels.
-        source_block = block_outlines.get(block) or [curve for lot in lots for curve in lot[2]]
-        Base.extend(source_block)
+        source_block = block_outlines.get(block) or dissolve_block(lots)
+        if source_block:
+            MapBlockBoundaries.extend(source_block)
+        else:
+            missing_boundaries.append(block)
+            source_block = [curve for lot in lots for curve in lot[2]]
+            Base.extend(source_block)
         block_bounds, block_span = measure(source_block)
         # An actual point on the source block outline identifies the map endpoint.
         anchor = source_block[0].PointAtStart
@@ -198,9 +226,15 @@ if x:
     Plots = Others
     Cards = Others + Selected
     Links = (selected_map_links or MapLinks) + RowLinks
+    Base.extend(MapBlockBoundaries)
     a = Base + BlockCards + Cards + Boxes + Links
     Info = (f"{len(BBL):,} plots | {len(BlockIDs):,} blocks | {row_index:,} rows | {len(Labels)} selected"
-            f" | {len(MapLinks)} map links available")
+            f" | {len(MapLinks)} map links available"
+            f" | {len(BlockIDs) - len(missing_boundaries):,} blocks outlined")
+    if missing_boundaries:
+        Info += "\nCheck block boundaries: " + ", ".join(missing_boundaries)
 else:
     Info = "Connect the original plot export path to x."
 print(Info)
+
+
