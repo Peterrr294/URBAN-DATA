@@ -1,7 +1,7 @@
 """Rhino 8 Grasshopper Python 3 Script-Mode.
 Inputs: x (JSON path, text), y (metric, text, optional).
 Optional inputs: Cols (int), CardWidth (float), CardHeight (float), Gap (float).
-Outputs: Base, Sites, Cards, Links, LabelPoints, Labels, Theme, Colors, TrafficLabels, Info.
+Outputs: Base, Sites, Cards, Boxes, Links, LabelPoints, Labels, Theme, Colors, TrafficLabels, Info.
 Geometry coordinates use the exported local origin and retain feet.
 """
 import json
@@ -10,7 +10,7 @@ import os
 import Rhino.Geometry as rg
 from System.Drawing import Color
 
-Base, Sites, Cards, Links = [], [], [], []
+Base, Sites, Cards, Boxes, Links = [], [], [], [], []
 LabelPoints, Labels, Theme, Colors, TrafficLabels = [], [], [], [], []
 Info = ""
 
@@ -65,29 +65,46 @@ else:
     for plot in plots:
         Base.extend(ring_curves(plot["rings"]))
 
-    # A single scale is shared across all card outlines.
+    # Fit each card to a 1500 x 1500 square with a 150-ft margin on every side.
+    box_size = 1500.0
+    half_box = box_size / 2
+    fit_span = box_size - 2 * 150.0
     cols = int(positive(globals().get("Cols"), min(5, math.ceil(math.sqrt(len(candidates)))), "Cols"))
     if cols < 1:
         raise ValueError("Cols must be at least one.")
-    cell_width = positive(globals().get("CardWidth"), width / cols, "CardWidth")
-    cell_height = positive(globals().get("CardHeight"), cell_width * .6, "CardHeight")
+    cell_width = max(box_size + 150.0, positive(globals().get("CardWidth"), width / cols, "CardWidth"))
+    cell_height = max(box_size + 450.0, positive(globals().get("CardHeight"), cell_width * .6, "CardHeight"))
     gap = positive(globals().get("Gap"), cell_height * .6, "Gap")
-    reach = max(
-        max(abs(v[0] - p["anchor"][0]), abs(v[1] - p["anchor"][1]))
-        for p in candidates for ring in p["rings"] for v in ring
-    )
-    scale = min(cell_width * .37, cell_height * .22) / max(reach, 1e-9)
     for i, plot in enumerate(candidates):
         column, row = i % cols, i // cols
         ax, ay = plot["anchor"]
         cx = xmin + (column + .5) * cell_width
-        cy = ymax + gap + (row + .6) * cell_height
-        Sites.extend(ring_curves(plot["rings"], z=1))
-        for ring in plot["rings"]:
-            shifted = [(cx + (v[0]-ax)*scale, cy + (v[1]-ay)*scale) for v in ring]
-            Cards.extend(ring_curves([shifted], z=2))
-        Links.append(rg.LineCurve(point((ax, ay), 1), point((cx, cy), 2)))
-        LabelPoints.append(point((cx - cell_width*.32, cy - cell_height*.26), 2))
+        cy = ymax + gap + half_box + row * cell_height
+        rings = [ring for ring in plot["rings"] if len(ring) >= 4]
+        vertices = [v for ring in rings for v in ring]
+        if not vertices:
+            raise ValueError(f"{plot['item_id']} has no drawable outline.")
+        px0 = min(v[0] for v in vertices)
+        px1 = max(v[0] for v in vertices)
+        py0 = min(v[1] for v in vertices)
+        py1 = max(v[1] for v in vertices)
+        span = max(px1 - px0, py1 - py0)
+        if not math.isfinite(span) or span <= 0:
+            raise ValueError(f"{plot['item_id']} has an invalid outline size.")
+        mx, my = (px0 + px1) / 2, (py0 + py1) / 2
+        card_scale = fit_span / span
+
+        def card_xy(v):
+            return cx + (v[0] - mx) * card_scale, cy + (v[1] - my) * card_scale
+
+        Sites.extend(ring_curves(rings, z=1))
+        Cards.extend(ring_curves([[card_xy(v) for v in ring] for ring in rings], z=2))
+        left, right = cx - half_box, cx + half_box
+        bottom, top = cy - half_box, cy + half_box
+        Boxes.extend(ring_curves([[(left, bottom), (right, bottom), (right, top),
+                                  (left, top), (left, bottom)]], z=2))
+        Links.append(rg.LineCurve(point((ax, ay), 1), point(card_xy((ax, ay)), 2)))
+        LabelPoints.append(point((left, bottom - 60.0), 2))
         v = plot["values"]
         Labels.append(
             f"{plot['item_id']} | {plot['type']} | {plot['plot_id']}\n"
@@ -121,8 +138,8 @@ else:
             f"Metric: {metric or 'off'} | observed range: "
             f"{value_text(min(values), 2) if values else 'n/a'} to "
             f"{value_text(max(values), 2) if values else 'n/a'}\n"
-            f"Shared card scale: {scale:.3f} | Grid: {cols} columns")
+            f"Box: {box_size:g} x {box_size:g} ft | Card span: {fit_span:g} ft | Grid: {cols} columns")
 
 # Default Script component outputs for a quick preview.
-a = Base + Sites + Cards + Links
+a = Base + Sites + Cards + Boxes + Links
 print(Info)
