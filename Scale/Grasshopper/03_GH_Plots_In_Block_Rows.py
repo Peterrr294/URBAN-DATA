@@ -1,8 +1,9 @@
 """Rhino 8 Grasshopper Python 3 Script Mode.
 
 Keep x connected to the existing JSON path or export folder.
-Optional outputs: Plots, Selected, Boxes, LabelPoints, Labels, BlockIDs,
-PlotTree. a is the complete row layout. y is unused.
+Optional outputs: Base, MapPlots, BlockCards, BlockLabelPoints, BlockLabels,
+Plots, Selected, Boxes, LabelPoints, Labels, MapLinks, RowLinks, BlockIDs,
+PlotTree. a previews the site-to-block-to-plot diagram. y is unused.
 """
 import csv
 import json
@@ -17,7 +18,7 @@ import Rhino.Geometry as rg
 BOX = 1500.0
 MARGIN = 150.0
 STEP_X = 1800.0
-STEP_Y = 1950.0
+STEP_Y = 2250.0
 MAX_PER_ROW = 100
 
 # Legacy named outputs are initialized for existing definitions.
@@ -28,6 +29,8 @@ Plots, Others, Selected, Boxes, LabelPoints, Labels, BlockIDs, BBL, Area = (
     [], [], [], [], [], [], [], [], []
 )
 SelectedPts = LabelPoints
+MapPlots, BlockCards, BlockLabelPoints, BlockLabels = [], [], [], []
+MapLinks, RowLinks = [], []
 PlotTree = DataTree[Object]()
 Info = ""
 
@@ -57,11 +60,13 @@ def read_inputs(path):
             atlas = json.load(stream)
         if atlas.get("schema") != 1:
             raise ValueError("Unsupported plot JSON schema.")
-        return [
+        records = [
             (str(plot["plot_id"]), str(plot["plot_id"])[:6], plot.get("item_id") or "",
              [ring_curve(ring) for ring in plot["rings"] if len(ring) >= 4], None)
             for plot in atlas["plots"]
         ]
+        boundary = [ring_curve(ring) for ring in atlas.get("boundary", []) if len(ring) >= 4]
+        return records, {}, boundary
 
     folder, filename = os.path.split(path)
     pair = next((pair for pair in names if filename.lower() in pair), None)
@@ -75,25 +80,58 @@ def read_inputs(path):
     model = rio.File3dm.Read(os.path.join(folder, pair[0]))
     if model is None:
         raise IOError("Cannot read " + pair[0])
-    curves = defaultdict(list)
+    curves, block_outlines = defaultdict(list), defaultdict(list)
+    boundary = []
     for obj in model.Objects:
-        key = obj.Attributes.Name
-        if key in by_bbl and isinstance(obj.Geometry, rg.Curve):
-            # Duplicate before the File3dm is released.
+        key = obj.Attributes.Name or ""
+        if not isinstance(obj.Geometry, rg.Curve):
+            continue
+        if key in by_bbl:
             curves[key].append(obj.Geometry.DuplicateCurve())
+        elif key.startswith("BLOCK-"):
+            block_outlines[key[6:]].append(obj.Geometry.DuplicateCurve())
+        elif key == "BOUNDARY":
+            boundary.append(obj.Geometry.DuplicateCurve())
     if set(curves) != set(by_bbl):
         raise ValueError("The 3DM and CSV have different plot IDs. Use one matching export.")
-    return [
+    records = [
         (key, row.get("block_id") or key[:6],
          (row.get("item_id") or key) if row["selected"] == "1" else "",
          curves[key], float(row["area_sqft"]))
         for key, row in by_bbl.items()
     ]
+    return records, block_outlines, boundary
+
+
+def measure(curves):
+    bounds = curves[0].GetBoundingBox(True)
+    for curve in curves[1:]:
+        bounds.Union(curve.GetBoundingBox(True))
+    span = max(bounds.Max.X - bounds.Min.X, bounds.Max.Y - bounds.Min.Y)
+    if span <= 0:
+        raise ValueError("An outline has no usable width or height.")
+    return bounds, span
+
+
+def fit(curves, center, span, cx, cy):
+    scaling = rg.Transform.Scale(center, (BOX - 2 * MARGIN) / span)
+    move = rg.Transform.Translation(cx - center.X, cy - center.Y, -center.Z)
+    result = []
+    for original in curves:
+        curve = original.DuplicateCurve()
+        curve.Transform(scaling)
+        curve.Transform(move)
+        result.append(curve)
+    return result
+
+
+def line(x1, y1, x2, y2):
+    return rg.LineCurve(rg.Point3d(x1, y1, 0), rg.Point3d(x2, y2, 0))
 
 
 if x:
     path = os.path.expanduser(str(x).strip().strip('"'))
-    records = read_inputs(path)
+    records, block_outlines, boundary = read_inputs(path)
     if not records:
         raise ValueError("No plots found.")
     if len({r[0] for r in records}) != len(records):
@@ -103,46 +141,66 @@ if x:
     for bbl, block, label, curves, area in records:
         if not curves:
             raise ValueError("Missing plot outline: " + bbl)
-        bounds = curves[0].GetBoundingBox(True)
-        for curve in curves[1:]:
-            bounds.Union(curve.GetBoundingBox(True))
-        span = max(bounds.Max.X - bounds.Min.X, bounds.Max.Y - bounds.Min.Y)
-        if span <= 0:
-            raise ValueError("Invalid outline size: " + bbl)
+        bounds, span = measure(curves)
         grouped[block].append((bbl, label, curves, area, bounds.Center, span))
+        MapPlots.extend(curves)
 
+    site_bounds, _ = measure(boundary if boundary else MapPlots)
+    first_header_x = site_bounds.Max.X + 3 * STEP_X
+    first_row_y = site_bounds.Max.Y
+    Base = list(boundary)
     BlockIDs = sorted(grouped)
     row_index = 0
+    selected_map_links = []
     for block_index, block in enumerate(BlockIDs):
-        # Left-aligned rows, longest original outlines first within each block.
         lots = sorted(grouped[block], key=lambda lot: (-lot[5], lot[0]))
-        for i, (bbl, label, curves, area, center, span) in enumerate(lots):
-            wrap, col = divmod(i, MAX_PER_ROW)
-            cx, cy = col * STEP_X, -(row_index + wrap) * STEP_Y
-            scaling = rg.Transform.Scale(center, (BOX - 2 * MARGIN) / span)
-            move = rg.Transform.Translation(cx - center.X, cy - center.Y, -center.Z)
-            destination = Selected if label else Others
-            for original in curves:
-                curve = original.DuplicateCurve()
-                curve.Transform(scaling)
-                curve.Transform(move)
-                destination.append(curve)
-                PlotTree.Add(curve, GH_Path(block_index))
-            if label:
-                h = BOX / 2
-                box = [(cx-h, cy-h), (cx+h, cy-h), (cx+h, cy+h),
-                       (cx-h, cy+h), (cx-h, cy-h)]
-                Boxes.append(ring_curve(box))
-                LabelPoints.append(rg.Point3d(cx - h, cy - h - 60, 0))
-                Labels.append(f"{label} | {bbl}")
-            BBL.append(bbl)
-            Area.append(area)
-        row_index += (len(lots) + MAX_PER_ROW - 1) // MAX_PER_ROW
+        # If the export has no dissolved block, show the original grouped parcels.
+        source_block = block_outlines.get(block) or [curve for lot in lots for curve in lot[2]]
+        Base.extend(source_block)
+        block_bounds, block_span = measure(source_block)
+        # An actual point on the source block outline identifies the map endpoint.
+        anchor = source_block[0].PointAtStart
+        cy = first_row_y - row_index * STEP_Y
+        link = line(anchor.X, anchor.Y, first_header_x - BOX / 2, cy)
+        MapLinks.append(link)
+        if any(lot[1] for lot in lots):
+            selected_map_links.append(link)
 
+        for offset in range(0, len(lots), MAX_PER_ROW):
+            row = lots[offset:offset + MAX_PER_ROW]
+            cy = first_row_y - row_index * STEP_Y
+            BlockCards.extend(fit(source_block, block_bounds.Center, block_span, first_header_x, cy))
+            BlockLabelPoints.append(rg.Point3d(first_header_x - BOX / 2, cy - BOX / 2 - 145, 0))
+            suffix = " (cont.)" if offset else ""
+            BlockLabels.append(f"Block {block}{suffix} | {len(lots)} plots")
+            end_x = first_header_x + len(row) * STEP_X
+            rail_y = cy - BOX / 2 - 30
+            RowLinks.append(line(first_header_x, rail_y, end_x, rail_y))
+
+            for col, (bbl, label, curves, area, center, span) in enumerate(row, 1):
+                cx = first_header_x + col * STEP_X
+                destination = Selected if label else Others
+                for curve in fit(curves, center, span, cx, cy):
+                    destination.append(curve)
+                    PlotTree.Add(curve, GH_Path(block_index))
+                if label:
+                    h = BOX / 2
+                    box = [(cx-h, cy-h), (cx+h, cy-h), (cx+h, cy+h),
+                           (cx-h, cy+h), (cx-h, cy-h)]
+                    Boxes.append(ring_curve(box))
+                    LabelPoints.append(rg.Point3d(cx - h, cy - h - 145, 0))
+                    Labels.append(f"{label} | {bbl}")
+                BBL.append(bbl)
+                Area.append(area)
+            row_index += 1
+
+    Blocks = BlockCards
     Plots = Others
     Cards = Others + Selected
-    a = Cards + Boxes
-    Info = f"{len(BBL):,} plots | {len(BlockIDs):,} blocks | {row_index:,} rows | {len(Labels)} selected"
+    Links = (selected_map_links or MapLinks) + RowLinks
+    a = Base + BlockCards + Cards + Boxes + Links
+    Info = (f"{len(BBL):,} plots | {len(BlockIDs):,} blocks | {row_index:,} rows | {len(Labels)} selected"
+            f" | {len(MapLinks)} map links available")
 else:
     Info = "Connect the original plot export path to x."
 print(Info)
