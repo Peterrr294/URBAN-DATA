@@ -3,7 +3,8 @@
 Keep x connected to the existing JSON path or export folder.
 Optional outputs: Base, MapBlockBoundaries, MapPlots, BlockCards, BlockLabelPoints, BlockLabels,
 Plots, Selected, Boxes, LabelPoints, Labels, MapLinks, RowLinks, BlockIDs,
-PlotTree. a previews the site-to-block-to-plot diagram. y is unused.
+PlotTree. a previews the exploded plots of blocks containing selected plots.
+Base and MapLinks can be previewed separately for site context. y is unused.
 """
 import csv
 import json
@@ -20,7 +21,7 @@ BOX = 1500.0
 MARGIN = 150.0
 STEP_X = 1800.0
 STEP_Y = 2250.0
-MAX_PER_ROW = 100
+MAX_PER_ROW = 12
 BLOCK_TOLERANCE = 0.01  # Local export coordinates are in feet.
 
 # Legacy named outputs are initialized for existing definitions.
@@ -160,8 +161,14 @@ if x:
     if len({r[0] for r in records}) != len(records):
         raise ValueError("Plot IDs must be unique.")
 
+    selected_blocks = {block for _, block, label, _, _ in records if label}
+    if not selected_blocks:
+        raise ValueError("No selected plots are marked in this export. Use the full export with selection flags.")
+
     grouped = defaultdict(list)
     for bbl, block, label, curves, area in records:
+        if block not in selected_blocks:
+            continue
         if not curves:
             raise ValueError("Missing plot outline: " + bbl)
         bounds, span = measure(curves)
@@ -175,9 +182,9 @@ if x:
     BlockIDs = sorted(grouped)
     row_index = 0
     missing_boundaries = []
-    selected_map_links = []
     for block_index, block in enumerate(BlockIDs):
         lots = sorted(grouped[block], key=lambda lot: (-lot[5], lot[0]))
+        selected_count = sum(bool(lot[1]) for lot in lots)
         source_block = block_outlines.get(block) or dissolve_block(lots)
         if source_block:
             MapBlockBoundaries.extend(source_block)
@@ -191,8 +198,6 @@ if x:
         cy = first_row_y - row_index * STEP_Y
         link = line(anchor.X, anchor.Y, first_header_x - BOX / 2, cy)
         MapLinks.append(link)
-        if any(lot[1] for lot in lots):
-            selected_map_links.append(link)
 
         for offset in range(0, len(lots), MAX_PER_ROW):
             row = lots[offset:offset + MAX_PER_ROW]
@@ -200,7 +205,7 @@ if x:
             BlockCards.extend(fit(source_block, block_bounds.Center, block_span, first_header_x, cy))
             BlockLabelPoints.append(rg.Point3d(first_header_x - BOX / 2, cy - BOX / 2 - 145, 0))
             suffix = " (cont.)" if offset else ""
-            BlockLabels.append(f"Block {block}{suffix} | {len(lots)} plots")
+            BlockLabels.append(f"Block {block}{suffix} | {len(lots)} plots | {selected_count} selected")
             end_x = first_header_x + len(row) * STEP_X
             rail_y = cy - BOX / 2 - 30
             RowLinks.append(line(first_header_x, rail_y, end_x, rail_y))
@@ -225,11 +230,11 @@ if x:
     Blocks = BlockCards
     Plots = Others
     Cards = Others + Selected
-    Links = (selected_map_links or MapLinks) + RowLinks
+    Links = MapLinks + RowLinks
     Base.extend(MapBlockBoundaries)
-    a = Base + BlockCards + Cards + Boxes + Links
-    Info = (f"{len(BBL):,} plots | {len(BlockIDs):,} blocks | {row_index:,} rows | {len(Labels)} selected"
-            f" | {len(MapLinks)} map links available"
+    a = BlockCards + Cards + Boxes + RowLinks
+    Info = (f"{len(BBL):,} of {len(records):,} plots shown | {len(BlockIDs):,} blocks with selected plots"
+            f" | {row_index:,} rows | {len(Labels)} selected"
             f" | {len(BlockIDs) - len(missing_boundaries):,} blocks outlined")
     if missing_boundaries:
         Info += "\nCheck block boundaries: " + ", ".join(missing_boundaries)
